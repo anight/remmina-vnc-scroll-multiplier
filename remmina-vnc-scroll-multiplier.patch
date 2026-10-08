@@ -1,0 +1,113 @@
+--- plugins/vnc/vnc_plugin.c
++++ plugins/vnc/vnc_plugin.c
+@@ -1512,17 +1512,28 @@
+ 	return TRUE;
+ }
+ 
+-static gint delta_to_mask(float delta, float *accum, gint mask_plus, gint mask_minus)
++/* Whole wheel steps in the accumulated smooth-scroll delta; the remainder is kept. */
++static gint delta_to_steps(float delta, float *accum)
+ {
++	gint steps;
++
+ 	*accum += delta;
+-	if (*accum >= 1.0) {
+-		*accum = 0.0;
+-		return mask_plus;
+-	} else if (*accum <= -1.0) {
+-		*accum = 0.0;
+-		return mask_minus;
++	steps = (gint)*accum;
++	*accum -= steps;
++	return steps;
++}
++
++static void remmina_plugin_vnc_send_wheel(RemminaProtocolWidget *gp, RemminaPluginVncCoordinates coordinates, gint mask, gint count)
++{
++	RemminaPluginVncData *gpdata = GET_PLUGIN_DATA(gp);
++	gint i;
++
++	for (i = 0; i < count; i++) {
++		remmina_plugin_vnc_event_push(gp, REMMINA_PLUGIN_VNC_EVENT_POINTER, GINT_TO_POINTER(coordinates.x), GINT_TO_POINTER(coordinates.y),
++					      GINT_TO_POINTER(mask | gpdata->button_mask));
++		remmina_plugin_vnc_event_push(gp, REMMINA_PLUGIN_VNC_EVENT_POINTER, GINT_TO_POINTER(coordinates.x), GINT_TO_POINTER(coordinates.y),
++					      GINT_TO_POINTER(gpdata->button_mask));
+ 	}
+-	return 0;
+ }
+ 
+ static gboolean remmina_plugin_vnc_on_scroll(GtkWidget *widget, GdkEventScroll *event, RemminaProtocolWidget *gp)
+@@ -1531,38 +1542,41 @@
+ 	RemminaPluginVncData *gpdata = GET_PLUGIN_DATA(gp);
+ 	RemminaFile *remminafile;
+ 	RemminaPluginVncCoordinates coordinates;
+-	gint mask;
++	gint multiplier;
++	gint steps_x = 0, steps_y = 0;	/* wheel steps: down and right are positive */
+ 
+ 	if (!gpdata->connected || !gpdata->client)
+ 		return FALSE;
+ 	remminafile = remmina_plugin_service->protocol_plugin_get_file(gp);
+ 	if (remmina_plugin_service->file_get_int(remminafile, "viewonly", FALSE))
+ 		return FALSE;
++	/* Wheel events sent per wheel step: some servers (macOS Screen Sharing) scroll very little per event */
++	multiplier = CLAMP(remmina_plugin_service->file_get_int(remminafile, "scrollmultiplier", 1), 1, 50);
+ 
+ 	switch (event->direction) {
+ 	case GDK_SCROLL_UP:
+-		mask = (1 << 3);
++		steps_y = -1;
+ 		gpdata->scroll_y_accumulator = 0;
+ 		break;
+ 	case GDK_SCROLL_DOWN:
+-		mask = (1 << 4);
++		steps_y = 1;
+ 		gpdata->scroll_y_accumulator = 0;
+ 		break;
+ 	case GDK_SCROLL_LEFT:
+-		mask = (1 << 5);
++		steps_x = -1;
+ 		gpdata->scroll_x_accumulator = 0;
+ 		break;
+ 	case GDK_SCROLL_RIGHT:
+-		mask = (1 << 6);
++		steps_x = 1;
+ 		gpdata->scroll_x_accumulator = 0;
+ 		break;
+ #if GTK_CHECK_VERSION(3, 4, 0)
+ 	case GDK_SCROLL_SMOOTH:
+ 		/* RFB does not seems to support SMOOTH scroll, so we accumulate GTK delta requested
+-		 * up to 1.0 and then send a normal RFB wheel scroll when the accumulator reaches 1.0 */
+-		mask = delta_to_mask(event->delta_y, &(gpdata->scroll_y_accumulator), (1 << 4), (1 << 3));
+-		mask |= delta_to_mask(event->delta_x, &(gpdata->scroll_x_accumulator), (1 << 6), (1 << 5));
+-		if (!mask)
++		 * and send one normal RFB wheel scroll for each whole 1.0 in the accumulator */
++		steps_y = delta_to_steps(event->delta_y, &(gpdata->scroll_y_accumulator));
++		steps_x = delta_to_steps(event->delta_x, &(gpdata->scroll_x_accumulator));
++		if (!steps_x && !steps_y)
+ 			return FALSE;
+ 		break;
+ #endif
+@@ -1571,10 +1585,10 @@
+ 	}
+ 
+ 	coordinates = remmina_plugin_vnc_scale_coordinates(widget, gp, event->x, event->y);
+-	remmina_plugin_vnc_event_push(gp, REMMINA_PLUGIN_VNC_EVENT_POINTER, GINT_TO_POINTER(coordinates.x), GINT_TO_POINTER(coordinates.y),
+-				      GINT_TO_POINTER(mask | gpdata->button_mask));
+-	remmina_plugin_vnc_event_push(gp, REMMINA_PLUGIN_VNC_EVENT_POINTER, GINT_TO_POINTER(coordinates.x), GINT_TO_POINTER(coordinates.y),
+-				      GINT_TO_POINTER(gpdata->button_mask));
++	if (steps_y)
++		remmina_plugin_vnc_send_wheel(gp, coordinates, steps_y > 0 ? (1 << 4) : (1 << 3), MIN(ABS(steps_y) * multiplier, 200));
++	if (steps_x)
++		remmina_plugin_vnc_send_wheel(gp, coordinates, steps_x > 0 ? (1 << 6) : (1 << 5), MIN(ABS(steps_x) * multiplier, 200));
+ 
+ 	return TRUE;
+ }
+@@ -2183,6 +2197,7 @@
+ #ifdef TCP_USER_TIMEOUT
+ 	{ REMMINA_PROTOCOL_SETTING_TYPE_INT,  "vnc_timeout", N_("TCP_USER_TIMEOUT length (seconds)"), FALSE, NULL, vnc_timeout_tooltip },
+ #endif // TCP_USER_TIMEOUT
++	{ REMMINA_PROTOCOL_SETTING_TYPE_INT,   "scrollmultiplier", N_("Mouse wheel multiplier"), FALSE, NULL, N_("Wheel events sent per wheel step (1-50). Raise it when the remote desktop scrolls too slowly, e.g. macOS.") },
+ 	{ REMMINA_PROTOCOL_SETTING_TYPE_CHECK, "tightencoding",          N_("Force tight encoding"),			        TRUE,  NULL, N_("Enabling this may help when the remote desktop looks scrambled") },
+ 	{ REMMINA_PROTOCOL_SETTING_TYPE_CHECK, "disablesmoothscrolling", N_("Disable smooth scrolling"),		        FALSE, NULL, NULL },
+ 	{ REMMINA_PROTOCOL_SETTING_TYPE_CHECK, "disablepasswordstoring", N_("Forget passwords after use"),		        TRUE,  NULL, NULL },
